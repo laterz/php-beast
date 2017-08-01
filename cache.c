@@ -18,39 +18,33 @@
 
 #include <stdlib.h>
 #include <sys/types.h>
+#ifndef PHP_WIN32
 #include <sys/mman.h>
+#endif
 
 #include "beast_mm.h"
 #include "spinlock.h"
 #include "php.h"
 #include "cache.h"
 #include "beast_log.h"
+#include "shm.h"
 
-#define BUCKETS_DEFAULT_SIZE 1021
+#define BUCKETS_DEFAULT_SIZE 8191
 
 static int beast_cache_initialization = 0;
 static cache_item_t **beast_cache_buckets = NULL;
 static beast_atomic_t *cache_lock;
-static int cache_pid = -1;
-
+extern int beast_pid;
 
 void beast_cache_lock()
 {
-    if (cache_pid == -1) {
-        cache_pid = (int)getpid();
-    }
-    beast_spinlock(cache_lock, cache_pid);
+    beast_spinlock(cache_lock, beast_pid);
 }
-
 
 void beast_cache_unlock()
 {
-    if (cache_pid == -1) {
-        cache_pid = (int)getpid();
-    }
-    beast_spinunlock(cache_lock, cache_pid);
+    beast_spinunlock(cache_lock, beast_pid);
 }
-
 
 static inline unsigned int
 beast_cache_hash(cache_key_t *key)
@@ -77,12 +71,7 @@ int beast_cache_init(int size)
     }
 
     /* init cache lock */
-    cache_lock = (int *)mmap(NULL,
-                             sizeof(int),
-                             PROT_READ|PROT_WRITE,
-                             MAP_SHARED|MAP_ANON,
-                             -1,
-                             0);
+    cache_lock = (int *)beast_shm_alloc(sizeof(int));
     if (!cache_lock) {
         beast_write_log(beast_log_error,
                         "Unable alloc share memory for cache lock");
@@ -95,16 +84,12 @@ int beast_cache_init(int size)
     /* init cache buckets's memory */
     bucket_size = sizeof(cache_item_t *) * BUCKETS_DEFAULT_SIZE;
 
-    beast_cache_buckets = (cache_item_t **)mmap(NULL,
-                                                bucket_size,
-                                                PROT_READ|PROT_WRITE,
-                                                MAP_SHARED|MAP_ANON,
-                                                -1,
-                                                0);
+    beast_cache_buckets = (cache_item_t **)beast_shm_alloc(bucket_size);
+
     if (!beast_cache_buckets) {
         beast_write_log(beast_log_error,
                         "Unable alloc share memory for cache buckets");
-        munmap((void *)cache_lock, sizeof(int));
+        beast_shm_free((void *)cache_lock, sizeof(int));
         beast_mm_destroy();
         return -1;
     }
@@ -162,8 +147,8 @@ cache_item_t *beast_cache_find(cache_key_t *key)
 
 cache_item_t *beast_cache_create(cache_key_t *key)
 {
-    cache_item_t *item, *next;
-    int i, msize, bsize;
+    cache_item_t *item;
+    int msize, bsize;
 
     msize = sizeof(*item) + key->fsize;
     bsize = sizeof(cache_item_t *) * BUCKETS_DEFAULT_SIZE;
@@ -203,7 +188,6 @@ cache_item_t *beast_cache_push(cache_item_t *item)
 {
     unsigned int hashval = beast_cache_hash(&item->key);
     unsigned int index = hashval % BUCKETS_DEFAULT_SIZE;
-    cache_item_t **this, *self;
 
     beast_cache_lock();
 
@@ -218,21 +202,16 @@ cache_item_t *beast_cache_push(cache_item_t *item)
 
 int beast_cache_destroy()
 {
-    int index;
-    cache_item_t *item, *next;
-
     if (!beast_cache_initialization) {
         return 0;
     }
 
-    beast_mm_destroy(); /* destroy memory manager */
+    beast_mm_destroy(); /* Destroy memory manager */
 
-    /* free cache buckets's mmap memory */
-    munmap((void *)beast_cache_buckets,
-           sizeof(cache_item_t *) * BUCKETS_DEFAULT_SIZE);
-
-    munmap((void *)cache_lock, sizeof(int));
-
+    /* Free cache buckets's mmap memory */
+    beast_shm_free((void *)beast_cache_buckets,
+            sizeof(cache_item_t *) * BUCKETS_DEFAULT_SIZE);
+    beast_shm_free((void *)cache_lock, sizeof(int));
     beast_cache_initialization = 0;
 
     return 0;
@@ -256,6 +235,23 @@ void beast_cache_info(zval *retval)
             item = item->next;
         }
     }
+
+    beast_cache_unlock();
+}
+
+void beast_cache_flush()
+{
+    int index;
+
+    beast_cache_lock();
+
+    /* Flush hash buckets */
+    for (index = 0; index < BUCKETS_DEFAULT_SIZE; index++) {
+        beast_cache_buckets[index] = NULL;
+    }
+
+    /* Flush share memory */
+    beast_mm_flush();
 
     beast_cache_unlock();
 }

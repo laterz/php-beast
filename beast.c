@@ -12,7 +12,8 @@
   | obtain it through the world-wide-web, please send a note to          |
   | license@php.net so we can mail you a copy immediately.               |
   +----------------------------------------------------------------------+
-  | Author: Liexusong <280259971@qq.com>                                 |
+  | Author: Liexusong <liexusong@qq.com>                                 |
+  |         maben <www.maben@foxmail.com>                                |
   +----------------------------------------------------------------------+
 */
 
@@ -24,25 +25,23 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <time.h>
-#include <pwd.h>
 
 typedef struct yy_buffer_state *YY_BUFFER_STATE;
 
 #include "zend.h"
 #include "zend_operators.h"
 #include "zend_globals.h"
-#include "php_globals.h"
 #include "zend_language_scanner.h"
-#include <zend_language_parser.h>
 
 #include "zend_API.h"
 #include "zend_compile.h"
 
 #include "php.h"
+#include "php_main.h"
+#include "php_globals.h"
 #include "php_ini.h"
 #include "main/SAPI.h"
 #include "ext/standard/info.h"
@@ -55,17 +54,27 @@ typedef struct yy_buffer_state *YY_BUFFER_STATE;
 #include "beast_module.h"
 #include "file_handler.h"
 
+#ifdef PHP_WIN32
+    #include <WinSock2.h>
+    #include <Iphlpapi.h>
+    #pragma comment(lib, PHP_LIB)
+    #pragma comment(lib, "Iphlpapi.lib")
+#else
+    #include <pwd.h>
+    #include <unistd.h>
+    #include <execinfo.h>
+#endif
+
 #if ZEND_MODULE_API_NO >= 20151012
 # define BEAST_RETURN_STRING(str, dup) RETURN_STRING(str)
 #else
 # define BEAST_RETURN_STRING(str, dup) RETURN_STRING(str, dup)
 #endif
 
-#define BEAST_VERSION       "2.6"
+#define BEAST_VERSION       "2.7"
 #define DEFAULT_CACHE_SIZE  10485760   /* 10MB */
 #define HEADER_MAX_SIZE     256
 #define INT_SIZE            (sizeof(int))
-
 
 extern struct beast_ops *ops_handler_list[];
 
@@ -74,8 +83,10 @@ extern struct beast_ops *ops_handler_list[];
  */
 char *beast_log_file = NULL;
 char *beast_log_user = NULL;
+int log_level = beast_log_notice;
 int beast_ncpu = 1;
 int beast_is_root = 0;
+int beast_pid = -1;
 
 /* True global resources - no need for thread safety here */
 static zend_op_array* (*old_compile_file)(zend_file_handle*, int TSRMLS_DC);
@@ -87,6 +98,8 @@ static int beast_max_filesize = 0;
 static char *local_networkcard = NULL;
 static int beast_now_time = 0;
 static int log_normal_file = 0;
+static char *beast_debug_path = NULL;
+static int beast_debug_mode = 0;
 
 /* {{{ beast_functions[]
  *
@@ -97,6 +110,7 @@ zend_function_entry beast_functions[] = {
     PHP_FE(beast_avail_cache,      NULL)
     PHP_FE(beast_support_filesize, NULL)
     PHP_FE(beast_file_expire,      NULL)
+    PHP_FE(beast_clean_cache,      NULL)
     {NULL, NULL, NULL}    /* Must be the last line in beast_functions[] */
 };
 /* }}} */
@@ -131,7 +145,9 @@ extern struct file_handler pipe_handler;
 static struct file_handler *default_file_handler = NULL;
 static struct file_handler *file_handlers[] = {
     &tmpfile_handler,
+#ifndef PHP_WIN32
     &pipe_handler,
+#endif
     NULL
 };
 
@@ -158,7 +174,7 @@ static int big_endian()
 }
 
 
-int filter_code_comments(char *filename, zval *retval)
+int filter_code_comments(char *filename, zval *retval TSRMLS_DC)
 {
     zend_lex_state original_lex_state;
     zend_file_handle file_handle = {0};
@@ -246,9 +262,9 @@ int encrypt_file(const char *inputfile,
     struct beast_ops *encrypt_ops = beast_get_encrypt_algo(encrypt_type);
 
     /* Get php codes from script file */
-    if (filter_code_comments((char *)inputfile, &codes) == -1) {
+    if (filter_code_comments((char *)inputfile, &codes TSRMLS_CC) == -1) {
         php_error_docref(NULL TSRMLS_CC, E_ERROR,
-                              "Unable get codes from php file `%s'", inputfile);
+                         "Unable get codes from php file `%s'", inputfile);
         return -1;
     }
 
@@ -332,8 +348,8 @@ failed:
 *****************************************************************************/
 
 int decrypt_file(const char *filename, int stream,
-    char **retbuf, int *retlen, int *free_buffer,
-    struct beast_ops **ret_encrypt TSRMLS_DC)
+        char **retbuf, int *retlen, int *free_buffer,
+        struct beast_ops **ret_encrypt TSRMLS_DC)
 {
     struct stat stat_ssb;
     cache_key_t findkey;
@@ -346,19 +362,53 @@ int decrypt_file(const char *filename, int stream,
     int entype;
     struct beast_ops *encrypt_ops;
     int retval = -1;
+    int n = 0;
+    int filesize = 0;
 
-    *free_buffer = 0; /* set free buffer flag to false */
-
-    if (fstat(stream, &stat_ssb) == -1) {
+#ifdef PHP_WIN32
+    ULARGE_INTEGER ull;
+    BY_HANDLE_FILE_INFORMATION fileinfo;
+    HANDLE hFile = (HANDLE)_get_osfhandle(stream);
+    if (!GetFileInformationByHandle(hFile, &fileinfo)) {
         beast_write_log(beast_log_error,
-                      "Failed to readed state buffer from file `%s'", filename);
+                "Failed to get file information from file `%s'", filename);
         retval = -1;
         goto failed;
     }
+    findkey.device = fileinfo.dwVolumeSerialNumber;
+    findkey.inode = fileinfo.nFileIndexHigh * (MAXDWORD + 1) + fileinfo.nFileIndexLow;
 
+
+    ull.LowPart = fileinfo.ftLastWriteTime.dwLowDateTime;
+    ull.HighPart = fileinfo.ftLastWriteTime.dwHighDateTime;
+
+    findkey.mtime =  ull.QuadPart / 10000000ULL - 11644473600ULL;
+    filesize = fileinfo.nFileSizeHigh * (MAXDWORD + 1) + fileinfo.nFileSizeLow;
+
+#else
+    if (fstat(stream, &stat_ssb) == -1) {
+        beast_write_log(beast_log_error,
+                "Failed to readed state buffer from file `%s'", filename);
+        retval = -1;
+        goto failed;
+    }
     findkey.device = stat_ssb.st_dev;
     findkey.inode = stat_ssb.st_ino;
     findkey.mtime = stat_ssb.st_mtime;
+    filesize = stat_ssb.st_size;
+#endif
+
+    /**
+     * 1) 1 int is dump length,
+     * 2) 1 int is expire time.
+     * 3) 1 int is encrypt type.
+     */
+    headerlen = encrypt_file_header_length + INT_SIZE * 3;
+
+    if (filesize < headerlen) { /* This file is not a encrypt file */
+        retval = -1;
+        goto failed;
+    }
 
     cache = beast_cache_find(&findkey);
 
@@ -368,18 +418,13 @@ int decrypt_file(const char *filename, int stream,
         return 0;
     }
 
-    /* not found cache and decrypt file */
+    *free_buffer = 0; /* Set free buffer flag to false */
 
-    /**
-     * 1) 1 int is dump length,
-     * 2) 1 int is expire time.
-     * 3) 1 int is encrypt type.
-     */
-    headerlen = encrypt_file_header_length + INT_SIZE * 3;
+    /*  Not found cache and decrypt file */
 
-    if (read(stream, header, headerlen) != headerlen) {
+    if ((n = read(stream, header, headerlen)) != headerlen) {
         beast_write_log(beast_log_error,
-                        "Failed to readed header from file `%s'", filename);
+                "Failed to readed header from file `%s', headerlen:%d, readlen:%d", filename, headerlen, n);
         retval = -1;
         goto failed;
     }
@@ -398,7 +443,7 @@ int decrypt_file(const char *filename, int stream,
         goto failed;
     }
 
-    /* real php script file's size */
+    /* Real php script file's size */
     reallen = *((int *)&header[encrypt_file_header_length]);
     expire  = *((int *)&header[encrypt_file_header_length + INT_SIZE]);
     entype  = *((int *)&header[encrypt_file_header_length + 2 * INT_SIZE]);
@@ -412,8 +457,8 @@ int decrypt_file(const char *filename, int stream,
     /* Check file size is vaild */
     if (beast_max_filesize > 0 && reallen > beast_max_filesize) {
         beast_write_log(beast_log_error,
-                        "File size `%d' out of max size `%d'",
-                        reallen, beast_max_filesize);
+                "File size `%d' out of max size `%d'",
+                reallen, beast_max_filesize);
         retval = -1;
         goto failed;
     }
@@ -428,18 +473,18 @@ int decrypt_file(const char *filename, int stream,
     *ret_encrypt = encrypt_ops = beast_get_encrypt_algo(entype);
 
     /**
-     * how many bytes would be read from encrypt file,
+     * How many bytes would be read from encrypt file,
      * subtract encrypt file's header size,
      * because we had read the header yet.
      */
 
-    bodylen = stat_ssb.st_size - headerlen;
+    bodylen = filesize - headerlen;
 
     /* 1) Alloc memory for decrypt file */
     if (!(buffer = malloc(bodylen))) {
         beast_write_log(beast_log_error,
-                        "Failed to alloc memory to file `%s' size `%d'",
-                        filename, bodylen);
+                "Failed to alloc memory to file `%s' size `%d'",
+                filename, bodylen);
         retval = -1;
         goto failed;
     }
@@ -447,7 +492,7 @@ int decrypt_file(const char *filename, int stream,
     /* 2) Read file stream */
     if (read(stream, buffer, bodylen) != bodylen) {
         beast_write_log(beast_log_error,
-                        "Failed to readed stream from file `%s'", filename);
+                "Failed to readed stream from file `%s'", filename);
         retval = -1;
         goto failed;
     }
@@ -455,22 +500,22 @@ int decrypt_file(const char *filename, int stream,
     /* 3) Decrypt file stream */
     if (encrypt_ops->decrypt(buffer, bodylen, &decbuf, &declen) == -1) {
         beast_write_log(beast_log_error,
-                        "Failed to decrypted file `%s', using `%s' handler",
-                        filename, encrypt_ops->name);
+                "Failed to decrypted file `%s', using `%s' handler",
+                filename, encrypt_ops->name);
         retval = -1;
         goto failed;
     }
 
-    free(buffer); /* buffer don't need right now and free it */
+    free(buffer); /* Buffer don't need right now and free it */
 
-    findkey.fsize = reallen;
+    findkey.fsize = reallen; /* How many size would we alloc from cache */
 
-    /* try add decrypt result to cache */
+    /* Try to add decrypt result to cache */
     if ((cache = beast_cache_create(&findkey))) {
 
         memcpy(beast_cache_data(cache), decbuf, reallen);
 
-        cache = beast_cache_push(cache); /* push cache into hash table */
+        cache = beast_cache_push(cache); /* Push cache into hash table */
 
         *retbuf = beast_cache_data(cache);
         *retlen = beast_cache_size(cache);
@@ -479,9 +524,11 @@ int decrypt_file(const char *filename, int stream,
             encrypt_ops->free(decbuf);
         }
 
-    } else {
+    } else {  /* Return raw buffer and we need free after PHP finished */
+
         *retbuf = decbuf;
         *retlen = reallen;
+
         *free_buffer = 1;
     }
 
@@ -493,6 +540,38 @@ failed:
     }
 
     return retval;
+}
+
+
+int beast_super_mkdir(char *path)
+{
+    char *head, *last;
+    char temp[1024];
+
+    for (head = last = path; *last; last++) {
+
+        if (*last == '/') {
+
+            if (last > head) {
+
+                memset(temp, 0, 1024);
+                memcpy(temp, path, last - path);
+
+                if (access(temp, F_OK) == -1) {
+                    if (mkdir(temp, 0777) != 0) {
+                        beast_write_log(beast_log_error,
+                                        "Failed to make new directory `%s'",
+                                        temp);
+                        return -1;
+                    }
+                }
+            }
+
+            head = last + 1;
+        }
+    }
+
+    return 0;
 }
 
 
@@ -509,18 +588,18 @@ cgi_compile_file(zend_file_handle *h, int type TSRMLS_DC)
 #endif
     char *buf;
     int fd;
-    FILE *filep = NULL;
+    FILE *fp = NULL;
     int size, free_buffer = 0;
     int retval;
     struct beast_ops *ops = NULL;
     int destroy_file_handler = 0;
 
-    filep = zend_fopen(h->filename, &opened_path TSRMLS_CC);
-     if (filep != NULL) {
-         fd = fileno(filep);
-     } else {
+    fp = zend_fopen(h->filename, &opened_path TSRMLS_CC);
+    if (fp != NULL) {
+        fd = fileno(fp);
+    } else {
         goto final;
-     }
+    }
 
     retval = decrypt_file(h->filename, fd, &buf, &size,
                           &free_buffer, &ops TSRMLS_CC);
@@ -530,8 +609,33 @@ cgi_compile_file(zend_file_handle *h, int type TSRMLS_DC)
         return NULL;
     }
 
-    if (retval == -1 ||
-        default_file_handler->open(default_file_handler) == -1 ||
+    if (retval == -1) goto final;  /* Using old_compile_file() */
+
+#if BEAST_DEBUG_MODE
+
+    if (beast_debug_mode && beast_debug_path) {
+
+        if (access(beast_debug_path, F_OK) == 0) {
+
+            char realpath[1024];
+
+            sprintf(realpath, "%s/%s", beast_debug_path, h->filename);
+
+            if (beast_super_mkdir(realpath) == 0) {
+
+                FILE *debug_fp = fopen(realpath, "w+");
+
+                if (debug_fp) {
+                    fwrite(buf, size, 1, debug_fp);
+                    fclose(debug_fp);
+                }
+            }
+        }
+    }
+
+#endif
+
+    if (default_file_handler->open(default_file_handler) == -1 ||
         default_file_handler->write(default_file_handler, buf, size) == -1 ||
         default_file_handler->rewind(default_file_handler) == -1)
     {
@@ -563,9 +667,7 @@ final:
         }
     }
 
-    if (filep) {
-        fclose(filep);
-    }
+    if (fp) fclose(fp);
 
     if (destroy_file_handler) {
         default_file_handler->destroy(default_file_handler);
@@ -747,6 +849,43 @@ ZEND_INI_MH(php_beast_log_user)
 #endif
 }
 
+ZEND_INI_MH(php_beast_log_level)
+{
+    char *level = NULL;
+#if ZEND_MODULE_API_NO >= 20151012
+
+    if (ZSTR_LEN(new_value) == 0) {
+        return SUCCESS;
+    }
+
+    level = ZSTR_VAL(new_value);
+
+#else
+
+    if (new_value_length == 0) {
+        return SUCCESS;
+    }
+
+    level = new_value;
+
+#endif
+    if (level == NULL) {
+        return FAILURE;
+    }
+
+    if (strcasecmp(level, "debug") == 0) {
+        log_level = beast_log_debug;
+    } else if (strcasecmp(level, "notice") == 0) {
+        log_level = beast_log_notice;
+    } else if (strcasecmp(level, "error") == 0) {
+        log_level = beast_log_error;
+    } else {
+        return FAILURE;
+    }
+
+    return SUCCESS;
+}
+
 
 ZEND_INI_MH(php_beast_enable)
 {
@@ -855,19 +994,97 @@ ZEND_INI_MH(php_beast_set_log_normal_file)
 }
 
 
+ZEND_INI_MH(php_beast_debug_path)
+{
+    #if ZEND_MODULE_API_NO >= 20151012
+
+    if (ZSTR_LEN(new_value) == 0) {
+        return SUCCESS;
+    }
+
+    beast_debug_path = estrdup(ZSTR_VAL(new_value));
+    if (beast_debug_path == NULL) {
+        return FAILURE;
+    }
+
+    return SUCCESS;
+
+#else
+
+    if (new_value_length == 0) {
+        return SUCCESS;
+    }
+
+    beast_debug_path = strdup(new_value);
+    if (beast_debug_path == NULL) {
+        return FAILURE;
+    }
+
+    return SUCCESS;
+
+#endif
+}
+
+
+ZEND_INI_MH(php_beast_debug_mode)
+{
+    #if ZEND_MODULE_API_NO >= 20151012
+
+    if (ZSTR_LEN(new_value) == 0) {
+        return FAILURE;
+    }
+
+    if (!strcasecmp(ZSTR_VAL(new_value), "on")
+        || !strcmp(ZSTR_VAL(new_value), "1"))
+    {
+        beast_debug_mode = 1;
+    } else {
+        beast_debug_mode = 0;
+    }
+
+    return SUCCESS;
+
+#else
+
+    if (new_value_length == 0) {
+        return FAILURE;
+    }
+
+    if (!strcasecmp(new_value, "on")
+        || !strcmp(new_value, "1"))
+    {
+        beast_debug_mode = 1;
+    } else {
+        beast_debug_mode = 0;
+    }
+
+    return SUCCESS;
+
+#endif
+}
+
+
 PHP_INI_BEGIN()
     PHP_INI_ENTRY("beast.cache_size", "10485760", PHP_INI_ALL,
           php_beast_cache_size)
-    PHP_INI_ENTRY("beast.log_file", "/tmp/php-beast.log", PHP_INI_ALL,
+    PHP_INI_ENTRY("beast.log_file", "./php-beast.log", PHP_INI_ALL,
           php_beast_log_file)
     PHP_INI_ENTRY("beast.log_user", "root", PHP_INI_ALL,
           php_beast_log_user)
+    PHP_INI_ENTRY("beast.log_level", "notice", PHP_INI_ALL,
+          php_beast_log_level)
     PHP_INI_ENTRY("beast.enable", "1", PHP_INI_ALL,
           php_beast_enable)
     PHP_INI_ENTRY("beast.networkcard", "eth0", PHP_INI_ALL,
           php_beast_set_networkcard)
     PHP_INI_ENTRY("beast.log_normal_file", "0", PHP_INI_ALL,
           php_beast_set_log_normal_file)
+#if BEAST_DEBUG_MODE
+    PHP_INI_ENTRY("beast.debug_path", "/tmp", PHP_INI_ALL,
+          php_beast_debug_path)
+    PHP_INI_ENTRY("beast.debug_mode", "0", PHP_INI_ALL,
+          php_beast_debug_mode)
+#endif
 PHP_INI_END()
 
 /* }}} */
@@ -875,6 +1092,9 @@ PHP_INI_END()
 
 void segmentfault_deadlock_fix(int sig)
 {
+#ifdef PHP_WIN32 // windows not support backtrace
+    beast_write_log(beast_log_error, "Segmentation fault and fix deadlock");
+#else
     void *array[10] = {0};
     size_t size;
     char **info = NULL;
@@ -891,7 +1111,7 @@ void segmentfault_deadlock_fix(int sig)
         }
         free(info);
     }
-
+#endif
     beast_mm_unlock();     /* Maybe lock mm so free here */
     beast_cache_unlock();  /* Maybe lock cache so free here */
 
@@ -899,16 +1119,105 @@ void segmentfault_deadlock_fix(int sig)
 }
 
 
-int validate_networkcard()
+static char *get_mac_address(char *networkcard)
+{
+#ifdef PHP_WIN32
+
+    // For windows
+    ULONG size = sizeof(IP_ADAPTER_INFO);
+    int ret, i;
+    char *address = NULL;
+    char buf[128] = { 0 }, *pos;
+
+    PIP_ADAPTER_INFO pCurrentAdapter = NULL;
+    PIP_ADAPTER_INFO pIpAdapterInfo = (PIP_ADAPTER_INFO)malloc(sizeof(*pIpAdapterInfo));
+    if (!pIpAdapterInfo) {
+        beast_write_log(beast_log_error, "Failed to allocate memory for IP_ADAPTER_INFO");
+        return NULL;
+    }
+
+    ret = GetAdaptersInfo(pIpAdapterInfo, &size);
+    if (ERROR_BUFFER_OVERFLOW == ret) {
+        // see ERROR_BUFFER_OVERFLOW https://msdn.microsoft.com/en-us/library/aa365917(VS.85).aspx
+        free(pIpAdapterInfo);
+        pIpAdapterInfo = (PIP_ADAPTER_INFO)malloc(size);
+
+        ret = GetAdaptersInfo(pIpAdapterInfo, &size);
+    }
+
+    if (ERROR_SUCCESS != ret) {
+        beast_write_log(beast_log_error, "Failed to get network adapter information");
+        free(pIpAdapterInfo);
+        return NULL;
+    }
+
+    pCurrentAdapter = pIpAdapterInfo;
+    do {
+        if (strcmp(pCurrentAdapter->AdapterName, networkcard) == 0) {
+            for (i = 0, pos = buf; i < pCurrentAdapter->AddressLength; i++, pos += 3) {
+                sprintf(pos, "%.2X-", (int)pCurrentAdapter->Address[i]);
+            }
+            *(--pos) = '\0'; // remove last -
+            address = strdup(buf);
+            break;
+        }
+        pCurrentAdapter = pCurrentAdapter->Next;
+    } while (pCurrentAdapter);
+
+    free(pIpAdapterInfo);
+    return address;
+
+#else
+
+    // For linux / unix
+    char netfile[128] = { 0 }, cmd[128] = { 0 }, buf[128] = { 0 };
+    FILE *fp;
+    char *retbuf, *curr, *last;
+
+    snprintf(netfile, 128, "/sys/class/net/%s/address", networkcard);
+
+    if (access((const char *)netfile, R_OK) != 0) { /* File not exists */
+        return NULL;
+    }
+
+    snprintf(cmd, 128, "cat %s", netfile);
+
+    fp = popen(cmd, "r");
+    if (!fp) {
+        return NULL;
+    }
+
+    retbuf = fgets(buf, 128, fp);
+
+    for (curr = buf, last = NULL; *curr; curr++) {
+        if (*curr != '\n') {
+            last = curr;
+        }
+    }
+
+    if (!last) {
+        return NULL;
+    }
+
+    for (last += 1; *last; last++) {
+        *last = '\0';
+    }
+
+    pclose(fp);
+
+    return strdup(buf);
+
+#endif
+}
+
+static int validate_networkcard()
 {
     extern char *allow_networkcards[];
-    char **ptr, *curr, *last;
+    char **ptr;
     char *networkcard_start, *networkcard_end;
     int endof_networkcard = 0;
     int active = 0;
-    FILE *fp;
-    char cmd[128], buf[128];
-    char *retbuf;
+    char *address;
 
     for (ptr = allow_networkcards; *ptr; ptr++, active++);
 
@@ -919,9 +1228,6 @@ int validate_networkcard()
     networkcard_start = networkcard_end = local_networkcard;
 
     while (1) {
-        memset(cmd, 0, 128);
-        memset(buf, 0, 128);
-
         while (*networkcard_end && *networkcard_end != ',') {
             networkcard_end++;
         }
@@ -932,39 +1238,20 @@ int validate_networkcard()
 
         if (*networkcard_end == ',') {
             *networkcard_end = '\0';
-        } else {
+        }
+        else {
             endof_networkcard = 1;
         }
 
-        snprintf(cmd, 128, "cat /sys/class/net/%s/address", networkcard_start);
-
-        fp = popen(cmd, "r");
-        if (!fp) {
-            return 0;
-        }
-
-        retbuf = fgets(buf, 128, fp);
-
-        for (curr = buf, last = NULL; *curr; curr++) {
-            if (*curr != '\n') {
-                last = curr;
+        address = get_mac_address(networkcard_start);
+        if (address) {
+            for (ptr = allow_networkcards; *ptr; ptr++) {
+                if (!strcasecmp(address, *ptr)) {
+                    free(address); /* release buffer */
+                    return 0;
+                }
             }
-        }
-
-        if (!last) {
-            return -1;
-        }
-
-        for (last += 1; *last; last++) {
-            *last = '\0';
-        }
-
-        pclose(fp);
-
-        for (ptr = allow_networkcards; *ptr; ptr++) {
-            if (!strcasecmp(buf, *ptr)) {
-                return 0;
-            }
+            free(address);
         }
 
         if (endof_networkcard) {
@@ -977,12 +1264,14 @@ int validate_networkcard()
     return -1;
 }
 
-
 /* {{{ PHP_MINIT_FUNCTION
  */
 PHP_MINIT_FUNCTION(beast)
 {
     int i;
+#ifdef PHP_WIN32
+    SYSTEM_INFO info;
+#endif
 
     /* If you have INI entries, uncomment these lines */
     REGISTER_INI_ENTRIES();
@@ -1028,12 +1317,13 @@ PHP_MINIT_FUNCTION(beast)
         return FAILURE;
     }
 
-    if (beast_log_init(beast_log_file) == -1) {
+    if (beast_log_init(beast_log_file, log_level) == -1) {
         php_error_docref(NULL TSRMLS_CC,
                          E_ERROR, "Unable open log file for beast");
         return FAILURE;
     }
 
+#ifndef PHP_WIN32
     if (getuid() == 0 && beast_log_user) { /* Change log file owner user */
         struct passwd *pwd;
 
@@ -1050,11 +1340,17 @@ PHP_MINIT_FUNCTION(beast)
             return FAILURE;
         }
     }
+#endif
 
     old_compile_file = zend_compile_file;
     zend_compile_file = cgi_compile_file;
 
+#ifdef PHP_WIN32
+    GetSystemInfo(&info);
+    beast_ncpu = info.dwNumberOfProcessors;
+#else
     beast_ncpu = sysconf(_SC_NPROCESSORS_ONLN); /* Get CPU nums */
+#endif
     if (beast_ncpu <= 0) {
         beast_ncpu = 1;
     }
@@ -1098,7 +1394,12 @@ PHP_MSHUTDOWN_FUNCTION(beast)
  */
 PHP_RINIT_FUNCTION(beast)
 {
+    if (beast_pid == -1) {
+        beast_pid = getpid();
+    }
+
     beast_now_time = time(NULL); /* Update now time */
+
     return SUCCESS;
 }
 /* }}} */
@@ -1138,16 +1439,16 @@ PHP_FUNCTION(beast_file_expire)
 
 #if ZEND_MODULE_API_NO >= 20151012
 
-    zend_string *__file;
+    zend_string *input_file;
 
     if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "S",
-                              &__file TSRMLS_CC) == FAILURE)
+                              &input_file TSRMLS_CC) == FAILURE)
     {
         RETURN_FALSE;
     }
 
-    file     = ZSTR_VAL(__file);
-    file_len = ZSTR_LEN(__file);
+    file     = ZSTR_VAL(input_file);
+    file_len = ZSTR_LEN(input_file);
 
 #else
 
@@ -1181,7 +1482,7 @@ PHP_FUNCTION(beast_file_expire)
     }
 
     if (expire > 0) {
-        string = php_format_date(format, strlen(format), expire, 1 TSRMLS_CC);
+        string = (char *)php_format_date(format, strlen(format), expire, 1 TSRMLS_CC);
         BEAST_RETURN_STRING(string, 0);
     } else {
         BEAST_RETURN_STRING("+Infinity", 1);
@@ -1257,11 +1558,17 @@ PHP_FUNCTION(beast_support_filesize)
     RETURN_LONG(beast_max_filesize);
 }
 
+
+PHP_FUNCTION(beast_clean_cache)
+{
+    beast_cache_flush();
+}
+
 /*
  * Local variables:
  * tab-width: 4
  * c-basic-offset: 4
  * End:
- * vim600: noet sw=4 ts=4 fdm=marker
+ * vim600: noet sw=4 ts=4 fdm=marker expandtab
  * vim<600: noet sw=4 ts=4
  */

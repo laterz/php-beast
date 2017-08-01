@@ -44,6 +44,7 @@ PHP_FUNCTION(beast_encode_file);
 PHP_FUNCTION(beast_avail_cache);
 PHP_FUNCTION(beast_support_filesize);
 PHP_FUNCTION(beast_file_expire);
+PHP_FUNCTION(beast_clean_cache);
 
 /*
   	Declare any global variables you may need between the BEGIN
@@ -79,6 +80,6 @@ ZEND_END_MODULE_GLOBALS(beast)
  * tab-width: 4
  * c-basic-offset: 4
  * End:
- * vim600: noet sw=4 ts=4 fdm=marker
+ * vim600: noet sw=4 ts=4 fdm=marker expandtab
  * vim<600: noet sw=4 ts=4
  */

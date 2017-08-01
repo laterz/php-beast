@@ -1,16 +1,18 @@
-```
+<pre>
         ____  __  ______     ____  _________   ___________
        / __ \/ / / / __ \   / __ )/ ____/   | / ___/_  __/
       / /_/ / /_/ / /_/ /  / __  / __/ / /| | \__ \ / /
      / ____/ __  / ____/  / /_/ / /___/ ___ |___/ // /
     /_/   /_/ /_/_/      /_____/_____/_/  |_/____//_/
-```
 
-<pre>
-此模块可以用于商业用途, 版权归原作者.<br/>
-QQ交流群：239243332<br/>
-<b>安装此扩展必须使用非线程安全版本，否则可能出错！！！</b>
+贡献者名字：
+@imaben (windows版本提供者)  https://github.com/imaben
+@pinguo-niulingyun (PHP7版本提供者) https://github.com/pinguo-niulingyun
+
+QQ交流群：239243332
 </pre>
+
+<b>Windows DLL：<a href="https://github.com/imaben/php-beast-binaries">下载地址</a></b>
 
 <b>php-beast可以自定义加密模块，加密模块编写教程: <a href="https://github.com/liexusong/php-beast/wiki/%E5%8A%A0%E5%AF%86%E6%A8%A1%E5%9D%97%E7%BC%96%E5%86%99%E6%95%99%E7%A8%8B">点击</a></b>
 
@@ -39,8 +41,16 @@ $ sudo make && make install
  beast.cache_size = size
  beast.log_file = "path_to_log"
  beast.log_user = "user"
+ beast.log_level = "debug"
  beast.enable = On
 </code></pre>
+
+beast.log_level支持参数：
+<pre>
+ 1. DEBUG
+ 2. NOTICE
+ 3. ERROR
+</pre>
 
 支持的模块有：
 <pre>
@@ -51,11 +61,8 @@ $ sudo make && make install
 
 通过测试环境:
 <pre><code>
- Nginx + Fastcgi + (PHP-5.2.x ~ PHP-5.6.x)
+ Nginx + Fastcgi + (PHP-5.2.x ~ PHP-7.1.x)
 </code></pre>
-
-<h3>注意</h3>
-如果出现502错误，一般是由于GCC版本太低导致，请先升级GCC再安装本模块。
 
 ------------------------------
 
@@ -111,7 +118,33 @@ char *allow_networkcards[] = {
 
 ------------------------------
 
-作者: liexusong(280259971@qq.com)。
+## 开启debug模式
+可以在configure时加入 `--enable-beast-debug` 选项来开启debug模式。开启debug模式后需要在php.ini配置文件中加入配置项：`beast.debug_path` 和 `beast.debug_mode`。`beast.debug_mode` 用于指定是否使用debug模式，而 `beast.debug_path` 用于输出解密后的php脚本源码。这样就可以在 `beast.debug_path` 目录中看到php-beast解密后的源代码，可以方便知道扩展解密是否正确。
+
+------------------------------
+
+## 函数列表
+*1.* beast_encode_file(): 用于加密一个文件
+
+*2.* beast_avail_cache(): 获取可以缓存大小
+
+*3.* beast_support_filesize(): 获取beast支持的最大可加密文件大小
+
+*4.* beast_file_expire(): 获取一个文件的过期时间
+
+*5.* beast_clean_cache(): 清空beast的所有缓存(如果有文件更新, 可以使用此函数清空缓存)
+
+------------------------------
+
+## 常见问题
+
+*1.* linux：如果出现502错误，一般是由于GCC版本太低导致，请先升级GCC再安装本模块。
+
+*2.* Windows：IIS环境下FastCGI进程异常退出：尝试将IIS的运行用户从ApplicationPoolIdentity改为LocalSystem
+
+------------------------------
+
+作者: 列旭松(280259971@qq.com)。
 
 <b>my book:《<a href="http://book.jd.com/11123177.html">PHP核心技术与最佳实践</a>》</b>此书有详细的PHP扩展编写教程<br/>
 ## 如果本项目能够帮到你的话请支持一下:

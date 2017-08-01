@@ -17,46 +17,60 @@
 */
 
 #include <stdlib.h>
-#include <pthread.h>
 #include "spinlock.h"
+#ifdef PHP_WIN32
+  #include <Windows.h>
+#else
+  #include <pthread.h>
+#endif
+#include "beast_log.h"
 
+#ifdef PHP_WIN32
+  #define compare_and_swap(lock, o, n) \
+      (InterlockedCompareExchange(lock, n, o) == n)
+  #define pause() YieldProcessor()
+  #define yield() SwitchToThread()
+#else
+  #define compare_and_swap(lock, o, n) \
+      __sync_bool_compare_and_swap(lock, o, n)
+  #ifdef __arm__
+    #define pause() __asm__("NOP");
+  #else
+    #define pause() __asm__("pause")
+  #endif
+  #define yield() sched_yield()
+#endif
 
 extern int beast_ncpu;
-
 
 void beast_spinlock(beast_atomic_t *lock, int pid)
 {
     int i, n;
 
     for ( ;; ) {
-
-        if (*lock == 0 && 
-            __sync_bool_compare_and_swap(lock, 0, pid)) {
+        if (compare_and_swap(lock, 0, pid)) {
             return;
         }
 
         if (beast_ncpu > 1) {
 
             for (n = 1; n < 129; n << 1) {
-    
-                for (i = 0; i < n; i++) {
-                    __asm__("pause");
-                }
-    
-                if (*lock == 0 && 
-                    __sync_bool_compare_and_swap(lock, 0, pid)) {
+
+                if (compare_and_swap(lock, 0, pid)) {
                     return;
+                }
+
+                for (i = 0; i < n; i++) {
+                    pause();
                 }
             }
         }
 
-        sched_yield();
+        yield();
     }
 }
 
-
 void beast_spinunlock(beast_atomic_t *lock, int pid)
 {
-    __sync_bool_compare_and_swap(lock, pid, 0);
+    compare_and_swap(lock, pid, 0);
 }
-
